@@ -1,9 +1,7 @@
 #!/bin/bash
 
-# If PDF file already exists, we don't
-# need to wait as long to make sure it
-# exists. We still wait a little bit though
-# for reflex purposes
+# If typst file doesn't exist, create it
+# so the typst compiler isn't taken by surprise
 if [ ! -f "$1" ]; then
 	touch "$1"
 fi
