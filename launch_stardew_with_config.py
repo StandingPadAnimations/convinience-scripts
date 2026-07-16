@@ -37,6 +37,14 @@ MODDED_STARDEW_PATH = (
 UNMODDED_STARDEW_PATH = (
     Path.home() / "Games" / "Heroic" / "Stardew Valley" / "game" / "Stardew Valley"
 )
+STARDEW_SAVE_PATH = (
+    Path.home()
+    / ".var"
+    / "app"
+    / "com.heroicgameslauncher.hgl"
+    / "config"
+    / "StardewValley"
+)
 
 # This Application ID is what Discord uses
 # for Stardew Valley when it detects it
@@ -91,7 +99,7 @@ def send_ipc_message(
     # Discord IPC expects two unsigned, 4 byte
     # integers before the JSON payload: one for
     # the opcode, and one for the length of the
-    # JSON payload itself
+    # JSON payload itself.
     header: bytes = struct.pack("<II", opcode.value, len(json_bytes))
     sock.sendall(header + json_bytes)
 
@@ -123,22 +131,54 @@ def main() -> None:
         else:
             for c in CONFIGS:
                 print(c)
-            while (selected_config := input("Select mod config [or vanilla]: ").lower()) not in tuple(CONFIGS) + ("vanilla",):
+            while (
+                selected_config := input("Select mod config [or vanilla]: ").lower()
+            ) not in tuple(CONFIGS) + ("vanilla",):
                 pass
 
         assert isinstance(selected_config, str)
         vanilla = selected_config == "vanilla"
 
+    XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR")
+    if not XDG_RUNTIME_DIR:
+        print("[Launch Script] Could not get XDG_RUNTIME_DIR, exiting...")
+        return
+
     # Set up arRPC and RPC status,
-    # unless explictly told not to
+    # unless explictly told not to.
     if not args.no_arrpc and not args.no_discord_rpc:
         arrpc_process = subprocess.Popen(
-            ["/usr/bin/npm", "exec", f"--package={str(ARRPC_PATH)}", "--", "arrpc"],
+            [
+                "bwrap",
+                "--unshare-all",
+
+                # Share net so we can
+                # connect to Discord
+                "--share-net",
+                "--new-session",
+                "--die-with-parent",
+                "--symlink", "/usr/lib", "lib",
+                "--symlink", "/usr/lib64", "lib64",
+                "--symlink","/usr/bin", "bin",
+                "--symlink", "/usr/bin", "sbin",
+                "--ro-bind", "/etc", "/etc",
+                "--ro-bind", "/usr/bin", "/usr/bin",
+                "--ro-bind", "/usr/lib", "/usr/lib",
+                "--ro-bind", "/usr/lib64", "/usr/lib64",
+                "--ro-bind", "/usr/share", "/usr/share",
+                "--proc", "/proc",
+                "--ro-bind", ARRPC_PATH, ARRPC_PATH,
+                "--dir", "/tmp",
+                "--dir", XDG_RUNTIME_DIR,
+                "--bind", XDG_RUNTIME_DIR, XDG_RUNTIME_DIR,
+                "--cap-drop", "ALL",
+                "/usr/bin/node", ARRPC_PATH / "src",
+            ],
             start_new_session=True,
         )
         _ = atexit.register(kill_arrpc, arrpc_process)
 
-        # Wait for arRPC to load up
+        # Wait for arRPC to load up.
         time.sleep(2)
 
     if not args.no_discord_rpc:
@@ -155,7 +195,7 @@ def main() -> None:
         if socket_path:
             print("[Launch Script] Connecting to IPC at", str(socket_path))
             # We can't use with because we want
-            # to continue on from this point
+            # to continue on from this point.
             discord_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             discord_socket.connect(str(socket_path))
 
@@ -170,7 +210,13 @@ def main() -> None:
                     "pid": os.getpid(),
                     "activity": {
                         "details": GAME_DETAILS,
-                        "state": GAME_STATE.format(group=(CONFIGS[selected_config] if selected_config else "Vanilla")),
+                        "state": GAME_STATE.format(
+                            group=(
+                                CONFIGS[selected_config]
+                                if selected_config
+                                else "Vanilla"
+                            )
+                        ),
                         "assets": {
                             "large_image": STARDEW_COVER_IMAGE,
                             "large_text": "Stardew Valley :3",
@@ -183,17 +229,29 @@ def main() -> None:
                 "nonce": "stardew-presence",
             }
 
-            _ = send_ipc_message(discord_socket, DiscordRPCOpCodes.FRAME, presence_payload)
+            _ = send_ipc_message(
+                discord_socket, DiscordRPCOpCodes.FRAME, presence_payload
+            )
 
             # Make sure we register the close function
             # when the script exits, since we're not
-            # using the with handler
+            # using the with handler.
             _ = atexit.register(close_discord_ipc_connection, discord_socket)
         else:
             print("[Launch Script] Could not find IPC!")
 
-    # Finally start the game up
+    # Finally start the game up.
+    #
+    # Get the DISPLAY and XAUTHORITY
+    # enviornment variables for the
+    # sandbox, since it seems Stardew
+    # Valley runs in X11.
+    DISPLAY = os.environ.get("DISPLAY", ":0")
+    XAUTHORITY = os.environ.get("XAUTHORITY", str(Path.home() / ".Xauthority"))
+
     mod_env = os.environ.copy()
+    mod_env["DISPLAY"] = DISPLAY
+    mod_env["XAUTHORITY"] = "/tmp/.Xauthority"  # Mapped in sandbox
     stardew_path = MODDED_STARDEW_PATH
     if vanilla:
         stardew_path = UNMODDED_STARDEW_PATH
@@ -202,7 +260,66 @@ def main() -> None:
             print("[Launch Script] Config invalid, exiting...")
             return
         mod_env["SMAPI_MODS_PATH"] = CONFIGS[selected_config]
-    _ = subprocess.run([stardew_path], env=mod_env)
+
+    # Let's make things simple and
+    # just pass the environment variables
+    # to the process and not use --clearenv.
+    #
+    # TODO: Explore having separate save files
+    # on a per-group basis by modifying sandbox
+    # arguments.
+    #
+    # Run Stardew Valley in a sandbox because
+    # we also run with mods (and who knows what
+    # are in those mods).
+    #
+    # Bubblewrap is the sandbox used by Flatpak,
+    # so it's pretty well tested.
+    _ = subprocess.run(
+        [
+            "bwrap",
+            "--unshare-all",
+
+            # Share net for co-op
+            "--share-net",
+            "--new-session",
+            "--die-with-parent",
+            "--symlink", "/usr/lib", "/lib",
+            "--symlink", "/usr/lib64", "/lib64",
+            "--symlink", "/usr/bin", "/bin",
+            "--symlink", "/usr/bin", "/sbin",
+            "--ro-bind", "/usr/lib", "/usr/lib",
+            "--ro-bind", "/usr/lib64", "/usr/lib64",
+            "--ro-bind", "/usr/bin", "/usr/bin",
+            "--ro-bind", "/etc", "/etc",
+            "--ro-bind", "/usr/share", "/usr/share",
+
+            # Bind X11 sockets because that's what Stardew
+            # Valley expects.
+            "--bind", "/tmp/.X11-unix", "/tmp/.X11-unix",
+            "--ro-bind-try", XAUTHORITY, "/tmp/.Xauthority",
+            "--dev", "/dev",
+            "--dev-bind", "/dev/dri", "/dev/dri",
+            "--proc", "/proc",
+            "--ro-bind", "/sys/dev/char", "/sys/dev/char",
+            "--ro-bind", "/sys/devices", "/sys/devices",
+            "--dir", XDG_RUNTIME_DIR,
+            "--ro-bind", f"{XDG_RUNTIME_DIR}/wayland-0", f"{XDG_RUNTIME_DIR}/wayland-0",
+            "--ro-bind",f"{XDG_RUNTIME_DIR}/pipewire-0", f"{XDG_RUNTIME_DIR}/pipewire-0",
+            "--ro-bind", f"{XDG_RUNTIME_DIR}/pulse", f"{XDG_RUNTIME_DIR}/pulse",
+            "--dir", "/tmp",
+            "--bind", STARDEW_SAVE_PATH, (Path.home() / ".config" / "StardewValley"),
+
+            # Mods typically patch game code, so we
+            # have to allow writing when playing with
+            # them. The vanilla game however *shouldn't*
+            # patch itself at runtime.
+            "--ro-bind" if vanilla else "--bind", stardew_path.parent, stardew_path.parent,
+            "--cap-drop", "ALL",
+            stardew_path,
+        ],
+        env=mod_env,
+    )
 
 
 if __name__ == "__main__":
